@@ -20,6 +20,6 @@ Los modelos y figuras del caso práctico pueden replicarse ejecutando los script
 
 ## Licencia
 
-Este repositorio tiene fines académicos y de divulgación. Si deseas reutilizar el contenido, se agradece citar adecuadamente al autor.
+Este repositorio tiene fines académicos y de divulgación. Si desea reutilizar el contenido, se agradece citar adecuadamente al autor.
 
 
