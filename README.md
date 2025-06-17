@@ -6,8 +6,8 @@ El estudio se centra en un modelo de **regresión beta bayesiana** para predecir
 
 ## Estructura del repositorio
 
-- `modelo_completo_jags.R`: estimación del modelo completo con todas las covariables usando JAGS.
-- `seleccion_modelos_inla.R`: selección del modelo óptimo mediante criterios bayesianos (DIC, WAIC, LCPO) con INLA.
+- `Caso_Práctico.Rmd`: estimación del modelo completo y el óptimo usando JAGS.
+- `selección_modelos_inla.R`: selección del modelo óptimo mediante criterios bayesianos (DIC, WAIC, LCPO) con INLA.
 
 ## Requisitos
 
