@@ -1,6 +1,6 @@
 # Análisis de los determinantes del rendimiento en el baloncesto
 
-Este repositorio contiene los códigos en R utilizados en el caso práctico del Trabajo de Fin de Grado titulado **"Análisis de los determinantes del rendimiento en el baloncesto"**, realizado por **Gonzalo Campos Gómez-Pardo** en la **Universitat de València**. El estudio se centra en un modelo de **regresión beta bayesiana** para predecir la **proporción de votos** recibida por los candidatos al premio **MVP** de la NBA, utilizando técnicas como **MCMC** e **INLA**.
+Este repositorio contiene los códigos en R utilizados en el caso práctico del Trabajo Fin de Grado titulado **"Análisis de los determinantes del rendimiento en el baloncesto"**, realizado por **Gonzalo Campos Gómez-Pardo** en la **Universitat de València**. El estudio se centra en un modelo de **regresión beta bayesiana** para predecir la **proporción de votos** recibida por los candidatos al premio **MVP** de la NBA, utilizando técnicas como **MCMC** e **INLA**.
 
 ## Estructura del repositorio
 
