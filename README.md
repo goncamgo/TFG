@@ -9,7 +9,7 @@ Este repositorio contiene los códigos en R utilizados en el caso práctico del 
 
 ## Requisitos
 
-- R versión ≥ 4.0.0
+- Versión R ≥ 4.0.0
 - Paquetes necesarios: `magrittr`, `httr`, `rvest`, `tidyverse`, `rjags`, `rethinking`, `GoFKernel`, `dplyr` e `INLA`.
 
 ## Reproducibilidad
