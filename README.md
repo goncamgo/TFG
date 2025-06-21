@@ -24,4 +24,4 @@ Este repositorio tiene fines académicos y de divulgación. Si desea reutilizar 
 
 Gonzalo Campos Gómez-Pardo, 2025.
 
-Trabajo fin de grado presentado en la Universitat de València - Facultat de Ciències Matemàtiques.
+Trabajo Fin de Grado presentado en la Universitat de València - Facultat de Ciències Matemàtiques.
