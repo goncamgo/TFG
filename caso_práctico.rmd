@@ -1,0 +1,702 @@
+---
+title: "Caso Práctico"
+author: "Gonzalo Campos Gómez-Pardo"
+date: '2025'
+output: html_document
+---
+
+# Librerías necesarias
+
+```{r,include=F}
+# Importar las librerías necesarias
+library(magrittr)
+library(httr)
+library(rvest)
+library(tidyverse)
+library(rjags)
+library(rethinking)
+library(GoFKernel)
+library(dplyr)
+library(INLA)
+set.seed(564) # Establecer semilla
+```
+
+# Depuración y preparación de datos
+
+```{r}
+# Dataframe donde estarán todos los datos necesarios desde la temporada 1979-80 hasta la 2022-23
+mvpdf <- data.frame()
+
+# Definir un User-Agent para evitar bloqueos realizando Web scraping
+my_user_agent <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
+# Bucle para obtener los datos de cada temporada
+for (year in 1980:2023) {
+  
+  # Realizar la solicitud con el User-Agent (Web scraping)
+  url_mvp <- sprintf("https://www.basketball-reference.com/awards/awards_%s.html", year)
+  page_mvp <- GET(url_mvp, user_agent(my_user_agent)) %>% read_html()
+  
+  # Extraer la tabla con las votaciones del MVP
+  mvp_table <- page_mvp %>%
+    html_node("#mvp") %>%
+    html_table(fill = TRUE)
+  
+  # Verificar si la tabla se ha extraído correctamente
+  if (!is.null(mvp_table)) {
+    #Renombrar las columnas
+    colnames(mvp_table) <- mvp_table[1,] # Usar primera fila como header de las columnas
+    mvp_table <- mvp_table[-1,] # Eliminar la fila de encabezado duplicada
+    
+    # Asegurar nombres válidos para programación
+    names(mvp_table) <- make.names(names(mvp_table))
+    
+    # Restaurar los nombres originales de covariables con símbolos especiales para mayor claridad
+    mvp_table <- mvp_table %>%
+      rename(
+        `FG%` = FG.,
+        `3P%` = X3P.,
+        `FT%` = FT.,
+        `WS/48` = WS.48
+      )
+    
+    # Agregar el año de la temporada a la tabla
+    mvp_table$season <- year
+    
+    # Reemplazar "TOT" por el equipo correcto para que el left_join funcione
+    mvp_table <- mvp_table %>%
+      mutate(Tm = case_when(
+        Player == "Dominique Wilkins" & season == 1994 ~ "ATL",
+        Player == "Clyde Drexler" & season == 1995 ~ "POR",
+        Player == "Vince Carter" & season == 2005 ~ "NJN",
+        Player == "Chauncey Billups" & season == 2009 ~ "DEN",
+        Player == "Stephen Jackson" & season == 2010 ~ "CHA",
+        Player == "Derrick Rose" & season == 2021 ~ "NYK",
+        Player == "James Harden" & season == 2021 ~ "BRK",
+        TRUE ~ Tm  # Dejar el resto igual
+      ))
+    
+    # Web scraping para obtener la covariable Bpm
+    url_adv <- sprintf("https://www.basketball-reference.com/leagues/NBA_%s_advanced.html", year)
+    page_adv <- tryCatch(read_html(url_adv), error = function(e) NULL)
+    
+    # Extraer la tabla que contiene Bpm
+    if (!is.null(page_adv)) {
+      adv_table <- page_adv %>%
+        html_node("table#advanced") %>% #ID correcto de la tabla en el HTML
+        html_table(fill = TRUE)
+    
+    # Verificar si la tabla se ha extraído correctamente  
+    if (!is.null(adv_table)) {
+        # Seleccionar Bpm según Jugador y Equipo
+        adv_table <- adv_table %>%
+          filter(Player != "Player") %>%  # Eliminar encabezados repetidos
+          select(Player, Team, BPM) %>%
+          mutate(BPM = as.numeric(BPM),
+                 season = year) # Agregar la temporada
+        # Renombrar `Team' como `Tm' para que coincida con `mvpdf'
+        colnames(adv_table)[colnames(adv_table) == "Team"] <- "Tm"
+        # Unir tablas
+        merged_table <- left_join(mvp_table, adv_table, by = c("Player", "Tm", "season"))
+        # Añadir al dataframe principal
+        mvpdf <- bind_rows(mvpdf, merged_table)
+      } else {
+        message(sprintf("No se encontró tabla avanzada para %d", year))
+      }
+    }
+  } else {
+    message(sprintf("No se encontró tabla MVP para %d", year))
+  }
+  # Pausa de 5 segundos entre cada solicitud para evitar el error 429
+  Sys.sleep(5)
+}
+# Mover Bpm antes de season
+mvpdf <- mvpdf %>%
+  relocate(BPM, .before= season)  
+```
+
+```{r}
+# Arreglar los tipos de variables
+mvpdf <- mvpdf %>%
+  mutate(Player = as.factor(Player),
+         Age = as.numeric(Age),
+         Tm = as.factor(Tm),
+         # Número de votos recibido para el primer puesto
+         First = as.numeric(First),
+         # Votos recibidos
+         Pts.Won= as.numeric(Pts.Won), 
+         # Votos máximos dicho año
+         Pts.Max = as.numeric(Pts.Max),
+         # Proporción de votos recibida
+         Share = as.numeric(Share),
+         PTS = as.numeric(PTS),
+         G = as.numeric(G), # Partidos jugados
+         MP = as.numeric(MP),
+         TRB = as.numeric(TRB),
+         AST = as.numeric(AST),
+         STL = as.numeric(STL),
+         BLK = as.numeric(BLK),
+         `FG%` = as.numeric(`FG%`),
+         `3P%` = as.numeric(`3P%`),
+         `FT%` = as.numeric(`FT%`),
+         WS = as.numeric(WS),
+         `WS/48` = as.numeric(`WS/48`),
+         season = as.factor(season))
+```
+
+# Modelo completo
+
+```{r}
+# Asociar un nombre a cada variable de la tabla mvpdf y estandarizar las covariables
+full_df <- data.frame(
+  Share = mvpdf$Share, 
+  Edad = standardize(mvpdf$Age),
+  Pts = standardize(mvpdf$PTS),
+  Part_Jugados = standardize(mvpdf$G),
+  Mins_Jugados = standardize(mvpdf$MP),
+  Reb_Tot = standardize(mvpdf$TRB),
+  Asist = standardize(mvpdf$AST),
+  Rob = standardize(mvpdf$STL),
+  Tap = standardize(mvpdf$BLK),
+  TC_Pct = standardize(mvpdf$`FG%`),
+  Triple_Pct = standardize(mvpdf$`3P%`),
+  TL_Pct = standardize(mvpdf$`FT%`),
+  Win_Share = standardize(mvpdf$WS),
+  Win_Share48 = standardize(mvpdf$`WS/48`),
+  Bpm = standardize(mvpdf$BPM))  %>%
+  drop_na() # Quitar los NAs asociados a la variable Triple_Pct
+
+# Variable respuesta del modelo completo
+y <- full_df[,1]
+
+# Valor de Share asociado a Stephen Curry en 2016 fue 1, obtuvo un MVP unánime
+y[which.max(y)] <- y[which.max(y)] - 0.00001 
+
+# Construir la matriz de diseño del modelo completo sin los "player id"
+x <- full_df[,2:ncol(full_df)]
+x <- cbind(1, x) # Agregar vector de 1 como intercepto
+```
+
+# Prior Predictive Check
+
+```{r}
+# Comparar previas  generadas con la función de densidad de los datos observados
+
+plot(NA, xlim=c(-0.1,1.1), ylim = c(0, 8),
+     xlab= "", ylab="Densidad")
+for(i in 1:200){
+  n <- nrow(x) # Número de filas de x
+  pmax <-  100
+  beta_0 <- rnorm(1, qlogis(mean(y)), 1) # Previa del intercepto 
+  beta <- rnorm(ncol(x)-1, 0, sqrt(10)) # Previas de los 14 coeficientes de regresión restantes
+  beta <- c(beta_0,beta) # Vector de betas
+  xb <-  as.matrix(x)%*%beta # Producto entre la matriz de diseño y el vector de betas
+  mu <- plogis(xb) # Aplicación de la función sigmoide
+  phi <- runif(1,0,pmax) # Previa del parámetro de dispersión
+  a <- mu*phi
+  b <- (1-mu)*phi # a y b son los parámetros de la beta
+  y_sim <- rbeta(n,a,b)
+  # Densidad de la beta por método de reflexión
+  d_sim <- density.reflected(y_sim, 0,1, bw=bw.nrd0(y_sim)*1.2)
+  lines(d_sim, col="lightblue")
+}
+
+# Función de densidad de los datos observados
+d_real <- density.reflected(y, 0,1, bw= bw.nrd0(y)*1.2)
+lines(d_real,col="red")
+
+legend("topright", legend = c("Share Simulado",'Share Real'),
+       lty = c(1), col = c("lightblue",'red'))
+```
+
+# Código del modelo en JAGS mediante la librería rjags
+
+```{r}
+model_code <- "
+  data{
+    D <- dim(x) # Obtener dimensión de la matriz de diseño
+    n <- D[1] # Número de observaciones (jugadores)
+    p <- D[2] # Número de covariables (incluyendo el intercepto)
+  }
+  
+  model{
+  
+    for(i in 1:n) {
+      # Función de verosimilitud: la variable respuesta sigue una distribución beta
+      y[i] ~ dbeta(a[i],b[i])
+      
+      # Muestra simulada de la distribución predictiva a posteriori
+      ynew[i] ~ dbeta(a[i],b[i])
+  
+      logit(mu[i]) <- x_beta[i] # Aplicar función de enlace logit para obtener mu en (0,1)
+      
+      # Reparametrización de la distribución beta en términos de mu y phi
+      a[i] <- mu[i]*phi
+      b[i] <- (1 - mu[i])*phi
+      
+      mean_player[i] <- a[i]/(a[i] + b[i]) # Media del jugador i bajo una beta
+      
+    }
+    # Producto matricial entre el predictor lineal y el vector de parámetros beta
+    x_beta <- x%*%beta
+    
+    # Previa para el intercepto: normal centrada en la media de y
+    beta[1] ~ dnorm(my, 1)
+    
+    # Previa no informativa para el resto de coeficientes: N(0,1)
+    for(i in 2:p) {
+    
+      beta[i] ~ dnorm(0, 0.1)
+      
+    }
+    # Previa uniforme para el parámetro de dispersión phi
+    phi ~ dunif(0, pmax)
+    
+  }
+"
+```
+
+# Ejecución del modelo completo en JAGS mediante la librería rjags
+
+```{r}
+# Ejecutar modelo
+model <- jags.model(file = textConnection(model_code), data = 
+                      list(y = y, # Variable respuesta
+                           x = x, # Matriz de diseño
+                           my = qlogis(mean(y)), # Media de la variable y
+                           pmax = 100), # Valor máximo para el parámetro de dispersión
+                    n.chains = 4, # Número de cadenas de Markov para la simulación
+                    n.adapt = 1000 # Número de iteraciones de la fase burn-in
+                    )
+```
+
+# Diagnóstico de convergencia de las cadenas de Markov
+
+```{r}
+# Extraer muestras MCMC para los coeficientes de regresión y el parámetro de dispersión
+test_samps <- coda.samples(model, 
+                      variable.names = c('beta','phi'), 
+                      n.iter = 20000)
+test_samps.df <- as.data.frame(test_samps[[1]])
+
+# Calcular el tamaño efectivo de la muestra (ESS)
+effectiveSize(test_samps)
+
+# Representación gráfica de las cadenas mediante traceplots
+par(mfrow = c(1,1))  # Asegurar que no se agrupen gráficos
+
+# Graficar cada parámetro por separado
+for (i in 1:ncol(as.matrix(test_samps))) {
+  plot(test_samps[, i],
+       ylab = "Valor",
+       xlab = "Iteración",
+       density = FALSE)
+}
+# Calcular el estadístico Gelman-Rubin
+gelman.diag(test_samps) 
+```
+
+# Posterior Predictive Check
+
+```{r}
+# Representar valores simulados para cada observación bajo el modelo ajustado
+ynew <- coda.samples(model, 
+                      variable.names = c('ynew'), 
+                      n.iter = 20000) # Número de iteraciones de cada cadena
+
+#Dataframe con las muestras ynew
+ynew.df <- as.data.frame(ynew[[1]])
+
+# Número de observaciones para las que se generan predicciones
+n <- ncol(ynew.df)
+
+# Número de simulaciones generadas desde la distribución predictiva a posteriori
+nsim <- nrow(ynew.df)
+
+# Representación gráfica de la distribución a posteriori
+plot(NA, xlim=c(-0.1,1.1), ylim = c(0, 12),
+     xlab= "", ylab="Densidad")
+for(i in 1:200)
+{
+# Densidades simuladas a partir de la distribución a posteriori
+  d_post_sim= density.reflected(t(ynew.df[i,]),0,1)
+  lines(d_post_sim, col="lightblue")
+}
+
+# Densidad de los datos observados por método de reflexión
+d_real <- density.reflected(y, 0,1, bw= bw.nrd0(y)*1.1)
+lines(d_real,col="red")
+
+legend("topright", legend = c("Share Simulado",'Share Real'),
+       lty = c(1), col = c("lightblue",'red'))
+```
+
+# Resultados del proceso inferencial bayesiano
+
+```{r}
+# Calcular intervalos de credibilidad
+test_samps.df_test <- (test_samps.df %>% precis(depth=2,prob=.95))[1:15,]
+test_samps.df_test$var = c("intercept",names(full_df)[2:ncol(full_df)])
+test_samps.df_test[,c(6,1:5)]
+
+# Calcular el error cuadrático medio (ECM)
+mean_player_samps <- coda.samples(model, 
+                      variable.names = c('mean_player'), 
+                      n.iter = 20000)
+mp.df <- as.data.frame(mean_player_samps[[1]])
+player_pred <- colMeans(mp.df)
+comparison <- cbind(player_pred, y,
+                 (y - player_pred)^2)
+ECM = mean((y - player_pred)^2)
+ECM
+```
+
+# Evaluar la relación entre el predictor principal (Win_Share) y la variable respuesta (Share)
+
+```{r}
+# Intervalo de predicción del 95% para nuevas observaciones simuladas
+ynew.PI <- apply(ynew.df, 2, PI, prob = .95) 
+
+# Intervalo de credibilidad del 95% para la media de la respuesta condicional al predictor
+mu.CI <- mp.df %>% precis(depth = 2, prob = .95) 
+
+# Representación gráfica
+ggplot(data = full_df, aes(x = Win_Share, y = Share)) +
+  geom_point() +  # Datos observados
+  geom_line(aes(x = Win_Share, y = colMeans(mp.df))) +  # Media a posteriori de la predicción
+  geom_ribbon(aes(ymin = mu.CI[, 3], ymax = mu.CI[, 4], x = Win_Share),
+              alpha = .2, fill = "blue") +  # Intervalo de credibilidad para la media
+  geom_ribbon(aes(ymin = ynew.PI[1, ], ymax = ynew.PI[2, ], x = Win_Share),
+              alpha = .3, fill = "pink") +  # Intervalo de predicción para nuevas observaciones
+  labs(
+    title = "Share vs. Win Share",
+    subtitle = "Posterior Predictive Check",
+    x = "Win Share",
+    y = "Share"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Usando Dataset de la temporada 2023-24 como set de validación
+
+```{r}
+beta_samps <- t(as.matrix(test_samps.df[,1:15])) # Matriz de 20000 x 15 (beta_0 a beta_14)
+phi_samps <- as.matrix(test_samps.df[,16]) # Matriz de 20000 x 1 (phi)
+
+# Arreglar las variables del subconjunto del dataframe original
+mvpdf_dup <- mvpdf %>%
+  mutate(Age = as.numeric(Age),
+         PTS = as.numeric(PTS),
+         G = as.numeric(G),
+         MP = as.numeric(MP),
+         TRB = as.numeric(TRB),
+         AST = as.numeric(AST),
+         STL = as.numeric(STL),
+         BLK = as.numeric(BLK),
+         `FG%` = as.numeric(`FG%`),
+         `3P%` = as.numeric(`3P%`),
+         `FT%` = as.numeric(`FT%`),
+         WS = as.numeric(WS),
+         `WS/48` = as.numeric(`WS/48`),
+         BPM= as.numeric(BPM)
+         )%>%
+  drop_na()
+
+# Reordenar las variables en términos del modelo
+mvpdf_dup <- mvpdf_dup[,c(3,11,9,10,12:21)]
+
+# Cargar conjunto de datos de la temporada 2023-24
+X2024_dat <- read.csv("2024_dat.txt")
+
+# Reordenar los datos de dicha temporada
+x_test <- X2024_dat[,c(3,11,9,10,12:21)]
+
+# Estandarizar los datos en términos de la media y la desviación típica
+for (i in 1:ncol(x_test)){
+  x_test[,i] = (x_test[,i] - mean(t(mvpdf_dup[,i])))/sd(t((mvpdf_dup[,i])))
+}
+# Crear matriz de diseño
+x_test <- cbind(1,x_test)
+x_test <- as.matrix(x_test)
+```
+
+# Resultados predictivos del modelo completo
+
+```{r}
+# Aplicar modelo al conjunto de datos de validación
+xb_test <- x_test%*%beta_samps
+xb_test <- t(xb_test)
+
+# Aplicar función sigmoide como inversa de la logit
+mu_test <- exp(xb_test)/(1+exp(xb_test))
+a_test = matrix(0,20000,ncol(mu_test))
+b_test = matrix(0,20000,ncol(mu_test))
+
+# Calcular muestras de a y b, que son los parámetros de la beta
+for(i in 1:20000){
+  a_test[i,] <- mu_test[i,]*phi_samps[i]
+  b_test[i,] <- (1-mu_test[i,])*phi_samps[i]
+}
+# Calcular predicciones
+preds_2024 <- a_test/(a_test+b_test)
+preds_2024_means <- colMeans(preds_2024) 
+pi_95 <- function(x){
+  # Cuantiles para los intervalos de predicción
+  quantile(x,probs=c(.025,.95)) 
+}
+preds_2024_quants <- apply(preds_2024,2, pi_95)
+
+# Crear un dataframe para almacenar las predicciones
+preds_df <- cbind("Share_Real" = X2024_dat$Share,
+      "Share_Simulado" = preds_2024_means, 
+      "Lower_95_PI" = preds_2024_quants[1,],
+      "Upper_95_PI" = preds_2024_quants[2,] )
+preds_df <- data.frame(preds_df)
+preds_df <- preds_df %>% 
+  mutate(Jugador = X2024_dat$Player, 
+         Ranking_MVP_Real = c(1:9),
+         Share_Simulado = round(Share_Simulado,digits=4)) %>% 
+  select(Jugador,Ranking_MVP_Real, 
+         Share_Real,Share_Simulado, Lower_95_PI,Upper_95_PI) %>% 
+  arrange(desc(Share_Simulado)) %>% 
+  mutate(Ranking_MVP_Sim = c(1:9)) %>% 
+  select(Jugador,Ranking_MVP_Real, Ranking_MVP_Sim, 
+        Share_Real,Share_Simulado,Lower_95_PI,Upper_95_PI)
+
+# Mostrar por pantalla
+preds_df
+```
+
+# Especificación óptima tras selección de modelos
+
+```{r}
+# Tomar resultados del código de selección de modelos
+
+# Dataframe final
+full_df_final= full_df[,-c(2,8,9,15)]
+
+# Variable respuesta
+y <- full_df_final[,1]
+
+# Ajustar Stephen Curry (2016)
+y[which.max(y)] <- y[which.max(y)] - 0.00001 
+
+# Construir la matriz de diseño sin los "player id"
+x <- full_df_final[,2:ncol(full_df_final)]
+x <- cbind(1, x) #Agregar vector de 1 como intercepto
+```
+
+# Prior Predictive Check
+
+```{r}
+# Comparar previas  generadas con la función de densidad de los datos observados
+
+plot(NA, xlim=c(-0.1,1.1), ylim = c(0, 8),
+     xlab= "", ylab="Densidad")
+for(i in 1:200){
+  n <- nrow(x) # Número de filas de x
+  pmax <-  100
+  beta_0 <- rnorm(1, qlogis(mean(y)), 1) # Previa del intercepto 
+  beta <- rnorm(ncol(x)-1, 0, sqrt(10)) # Previas de los 14 coeficientes de regresión restantes
+  beta <- c(beta_0,beta) # Vector de betas
+  xb <-  as.matrix(x)%*%beta # Producto entre la matriz de diseño y el vector de betas
+  mu <- plogis(xb) # Aplicación de la función sigmoide
+  phi <- runif(1,0,pmax) # Previa del parámetro de dispersión
+  a <- mu*phi
+  b <- (1-mu)*phi # a y b son los parámetros de la beta
+  y_sim <- rbeta(n,a,b)
+  # Densidad de la beta por método de reflexión
+  d_sim <- density.reflected(y_sim, 0,1, bw=bw.nrd0(y_sim)*1.2)
+  lines(d_sim, col="lightblue")
+}
+
+# Función de densidad de los datos observados
+d_real <- density.reflected(y, 0,1, bw= bw.nrd0(y)*1.2)
+lines(d_real,col="red")
+
+legend("topright", legend = c("Share Simulado",'Share Real'),
+       lty = c(1), col = c("lightblue",'red'))
+```
+
+# Ejecución del modelo óptimo en JAGS mediante la librería rjags
+
+```{r}
+# Ejecutar modelo
+model <- jags.model(file = textConnection(model_code), data = 
+                      list(y = y, # Variable respuesta
+                           x = x, # Matriz de diseño
+                           my = qlogis(mean(y)), # Media de la variable y
+                           pmax = 100), # Valor máximo para el parámetro de dispersión
+                    n.chains = 4, # Número de cadenas MCMC para la simulación
+                    n.adapt = 1000 # Número de iteraciones fase burn-in
+                    )
+```
+
+# Diagnóstico de convergencia de las cadenas de Markov
+
+```{r}
+# Extraer muestras MCMC para los coeficientes de regresión y para el parámetro de dispersión
+test_samps <- coda.samples(model, 
+                      variable.names = c('beta','phi'), 
+                      n.iter = 20000)
+test_samps.df <- as.data.frame(test_samps[[1]])
+
+# Calcular el tamaño efectivo de la muestra (ESS)
+effectiveSize(test_samps)
+
+# Representación gráfica de las cadenas mediante traceplots
+par(mfrow = c(1,1))
+
+# Graficar cada parámetro por separado
+for (i in 1:ncol(as.matrix(test_samps))) {
+  plot(test_samps[, i],
+       ylab = "Valor",
+       xlab = "Iteración",
+       density = FALSE)
+}
+# Calcular el estadístico Gelman-Rubin
+gelman.diag(test_samps)
+```
+
+# Posterior Predictive Check
+
+```{r}
+# Representar valores simulados para cada observación bajo el modelo ajustado
+ynew <- coda.samples(model, 
+                      variable.names = c('ynew'), 
+                      n.iter = 20000) # Número de iteraciones de cada cadena
+
+#Dataframe con las muestras ynew
+ynew.df <- as.data.frame(ynew[[1]])
+
+# Número de observaciones para las que se generan predicciones
+n <- ncol(ynew.df)
+
+# Número de simulaciones generadas desde la distribución predictiva a posteriori
+nsim <- nrow(ynew.df)
+
+# Representación gráfica de la distribución a posteriori
+plot(NA, xlim=c(-0.1,1.1), ylim = c(0, 12),
+     xlab= "", ylab="Densidad")
+for(i in 1:200)
+{
+# Densidades simuladas a partir de la distribución a posteriori
+  d_post_sim= density.reflected(t(ynew.df[i,]),0,1)
+  lines(d_post_sim, col="lightblue")
+}
+
+# Densidad de los datos observados por método de reflexión
+d_real <- density.reflected(y, 0,1, bw= bw.nrd0(y)*1.1)
+lines(d_real,col="red")
+
+legend("topright", legend = c("Share Simulado",'Share Real'),
+       lty = c(1), col = c("lightblue",'red'))
+```
+
+# Resultados del proceso inferencial bayesiano
+
+```{r}
+# Calcular intervalos de credibilidad
+test_samps.df_test <- (test_samps.df %>% precis(depth=2,prob=.95))[1:11,]
+test_samps.df_test$var = c("intercept",names(full_df_final)[2:ncol(full_df_final)])
+test_samps.df_test[,c(6,1:5)]
+
+# Calcular el error cuadrático medio (ECM)
+meean_player_samps <- coda.samples(model, 
+                      variable.names = c('mean_player'), 
+                      n.iter = 20000)
+mp.df <- as.data.frame(meean_player_samps[[1]])
+player_pred <- colMeans(mp.df)
+comparison <- cbind(player_pred, y,
+                 (y - player_pred)^2)
+ECM = mean((y - player_pred)^2)
+ECM
+```
+
+# Usando Dataset de la temporada 2023-24 como set de validación
+
+```{r}
+# Cargar en beta y phi
+beta_samps <- t(as.matrix(test_samps.df[,1:11])) # Matriz de 20000 x 12 (beta_0 a beta_11)
+phi_samps <- as.matrix(test_samps.df[,12]) # Matriz de 20000 x 1 (phis)
+
+# Arreglar las variables del subconjunto del dataframe original
+mvpdf_dup <- mvpdf %>%
+  mutate(PTS = as.numeric(PTS),
+         G = as.numeric(G),
+         MP = as.numeric(MP),
+         TRB = as.numeric(TRB),
+         AST = as.numeric(AST),
+         `FG%` = as.numeric(`FG%`),
+         `3P%` = as.numeric(`3P%`),
+         `FT%` = as.numeric(`FT%`),
+         WS = as.numeric(WS),
+         `WS/48` = as.numeric(`WS/48`)
+         )%>%
+  drop_na()
+
+# Reordenar las variables en términos del modelo
+mvpdf_dup <- mvpdf_dup[,c(11,9,10,12,13,16:20)]
+
+# Cargar conjunto de datos de la temporada 2023-24
+X2024_dat_final <- X2024_dat[,-c(3,14,15)]
+
+# Reordenar los datos de dicha temporada
+x_test <- X2024_dat_final[,c(10,8,9,11:17)]
+
+# Estandarizar los datos en términos de la media y la desviación típica
+for (i in 1:ncol(x_test)){
+  x_test[,i] = (x_test[,i] - mean(t(mvpdf_dup[,i])))/sd(t((mvpdf_dup[,i])))
+}
+# Crear matriz de diseño
+x_test <- cbind(1,x_test)
+x_test <- as.matrix(x_test)
+```
+
+# Resultados predictivos del modelo óptimo
+
+```{r}
+# Aplicar modelo al conjunto de datos de validación
+xb_test <- x_test%*%beta_samps
+xb_test <- t(xb_test)
+
+# Aplicar función sigmoide como inversa de la logit
+mu_test <- exp(xb_test)/(1+exp(xb_test))
+a_test = matrix(0,20000,ncol(mu_test))
+b_test = matrix(0,20000,ncol(mu_test))
+
+# Calcular muestras de a y b, que son los parámetros de la beta
+for(i in 1:20000){
+  a_test[i,] <- mu_test[i,]*phi_samps[i]
+  b_test[i,] <- (1-mu_test[i,])*phi_samps[i]
+}
+# Calcular predicciones
+preds_2024 <- a_test/(a_test+b_test)
+preds_2024_means <- colMeans(preds_2024)
+pi_95 <- function(x){
+# Cuantiles para los intervalos de predicción
+  quantile(x,probs=c(.025,.975))
+}
+preds_2024_quants <- apply(preds_2024,2, pi_95)
+
+# Crear un dataframe para almacenar las predicciones
+preds_df <- cbind("Share_Real" = X2024_dat$Share,
+      "Share_Simulado" = preds_2024_means, 
+      "Lower_95_PI" = preds_2024_quants[1,],
+      "Upper_95_PI" = preds_2024_quants[2,] )
+preds_df <- data.frame(preds_df)
+preds_df <- preds_df %>% 
+  mutate(Jugador = X2024_dat$Player, 
+         Ranking_MVP_Real = c(1:9),
+         Share_Simulado = round(Share_Simulado,digits=4)) %>% 
+  select(Jugador,Ranking_MVP_Real, 
+         Share_Real,Share_Simulado, Lower_95_PI,Upper_95_PI) %>% 
+  arrange(desc(Share_Simulado)) %>% 
+  mutate(Ranking_MVP_Sim = c(1:9)) %>% 
+  select(Jugador,Ranking_MVP_Real, Ranking_MVP_Sim, 
+        Share_Real,Share_Simulado,Lower_95_PI,Upper_95_PI)
+
+# Mostrar por pantalla
+preds_df
+```
