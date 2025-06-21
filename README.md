@@ -4,7 +4,7 @@ Este repositorio contiene los scripts en R utilizados en el caso práctico del T
 
 ## Estructura del repositorio
 
-- `Caso_Práctico.Rmd`: estimación del modelo completo y el óptimo usando JAGS.
+- `Caso_Práctico.rmd`: estimación del modelo completo y el óptimo usando JAGS.
 - `sel_modelos_inla.R`: selección del modelo óptimo mediante criterios bayesianos (DIC, WAIC, LCPO) con INLA.
 
 ## Requisitos
